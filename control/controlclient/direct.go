@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -32,6 +33,7 @@ import (
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/oauth2"
 	"inet.af/netaddr"
+	"tailscale.com/health"
 	"tailscale.com/log/logheap"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netns"
@@ -172,8 +174,23 @@ func NewHostinfo() *tailcfg.Hostinfo {
 		Hostname:   hostname,
 		OS:         version.OS(),
 		OSVersion:  osv,
+		Package:    packageType(),
 		GoArch:     runtime.GOARCH,
 	}
+}
+
+func packageType() string {
+	switch runtime.GOOS {
+	case "windows":
+		if _, err := os.Stat(`C:\ProgramData\chocolatey\lib\tailscale`); err == nil {
+			return "choco"
+		}
+	case "darwin":
+		// Using tailscaled or IPNExtension?
+		exe, _ := os.Executable()
+		return filepath.Base(exe)
+	}
+	return ""
 }
 
 // SetHostinfo clones the provided Hostinfo and remembers it for the
@@ -521,9 +538,16 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 		DebugFlags: c.debugFlags,
 		OmitPeers:  cb == nil,
 	}
+	var extraDebugFlags []string
 	if hostinfo != nil && ipForwardingBroken(hostinfo.RoutableIPs) {
+		extraDebugFlags = append(extraDebugFlags, "warn-ip-forwarding-off")
+	}
+	if health.RouterHealth() != nil {
+		extraDebugFlags = append(extraDebugFlags, "warn-router-unhealthy")
+	}
+	if len(extraDebugFlags) > 0 {
 		old := request.DebugFlags
-		request.DebugFlags = append(old[:len(old):len(old)], "warn-ip-forwarding-off")
+		request.DebugFlags = append(old[:len(old):len(old)], extraDebugFlags...)
 	}
 	if c.newDecompressor != nil {
 		request.Compress = "zstd"

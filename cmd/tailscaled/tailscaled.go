@@ -52,6 +52,10 @@ func defaultTunName() string {
 		return "tun"
 	case "windows":
 		return "Tailscale"
+	case "darwin":
+		// "utun" is recognized by wireguard-go/tun/tun_darwin.go
+		// as a magic value that uses/creates any free number.
+		return "utun"
 	}
 	return "tailscale0"
 }
@@ -65,6 +69,17 @@ var args struct {
 	statepath  string
 	socketpath string
 	verbose    int
+}
+
+var (
+	installSystemDaemon   func([]string) error // non-nil on some platforms
+	uninstallSystemDaemon func([]string) error // non-nil on some platforms
+)
+
+var subCommands = map[string]*func([]string) error{
+	"install-system-daemon":   &installSystemDaemon,
+	"uninstall-system-daemon": &uninstallSystemDaemon,
+	"debug":                   &debugModeFunc,
 }
 
 func main() {
@@ -87,11 +102,19 @@ func main() {
 	flag.StringVar(&args.socketpath, "socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
 
-	if len(os.Args) > 1 && os.Args[1] == "debug" {
-		if err := debugMode(os.Args[2:]); err != nil {
-			log.Fatal(err)
+	if len(os.Args) > 1 {
+		sub := os.Args[1]
+		if fp, ok := subCommands[sub]; ok {
+			if *fp == nil {
+				log.SetFlags(0)
+				log.Fatalf("%s not available on %v", sub, runtime.GOOS)
+			}
+			if err := (*fp)(os.Args[2:]); err != nil {
+				log.SetFlags(0)
+				log.Fatal(err)
+			}
+			return
 		}
-		return
 	}
 
 	if beWindowsSubprocess() {
@@ -108,7 +131,13 @@ func main() {
 		os.Exit(0)
 	}
 
+	if runtime.GOOS == "darwin" && os.Getuid() != 0 {
+		log.SetFlags(0)
+		log.Fatalf("tailscaled requires root; use sudo tailscaled")
+	}
+
 	if args.socketpath == "" && runtime.GOOS != "windows" {
+		log.SetFlags(0)
 		log.Fatalf("--socket is required")
 	}
 
@@ -163,9 +192,9 @@ func run() error {
 
 	var e wgengine.Engine
 	if args.fake {
-		var impl wgengine.FakeImplFunc
+		var impl wgengine.FakeImplFactory
 		if args.tunname == "userspace-networking" {
-			impl = netstack.Impl
+			impl = netstack.Create
 		}
 		e, err = wgengine.NewFakeUserspaceEngine(logf, 0, impl)
 	} else {

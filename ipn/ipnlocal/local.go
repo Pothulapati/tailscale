@@ -310,7 +310,7 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 		prefsChanged = true
 	}
 	if st.NetMap != nil {
-		if b.keepOneExitNodeLocked(st.NetMap) {
+		if b.findExitNodeIDLocked(st.NetMap) {
 			prefsChanged = true
 		}
 		b.setNetMapLocked(st.NetMap)
@@ -371,51 +371,35 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 	b.authReconfig()
 }
 
-// keepOneExitNodeLocked edits nm to retain only the default
-// routes provided by the exit node specified in b.prefs. It returns
-// whether prefs was mutated as part of the process, due to an exit
-// node IP being converted into a node ID.
-func (b *LocalBackend) keepOneExitNodeLocked(nm *netmap.NetworkMap) (prefsChanged bool) {
+// findExitNodeIDLocked updates b.prefs to reference an exit node by ID,
+// rather than by IP. It returns whether prefs was mutated.
+func (b *LocalBackend) findExitNodeIDLocked(nm *netmap.NetworkMap) (prefsChanged bool) {
 	// If we have a desired IP on file, try to find the corresponding
 	// node.
-	if !b.prefs.ExitNodeIP.IsZero() {
-		// IP takes precedence over ID, so if both are set, clear ID.
-		if b.prefs.ExitNodeID != "" {
-			b.prefs.ExitNodeID = ""
-			prefsChanged = true
-		}
-
-	peerLoop:
-		for _, peer := range nm.Peers {
-			for _, addr := range peer.Addresses {
-				if !addr.IsSingleIP() || addr.IP != b.prefs.ExitNodeIP {
-					continue
-				}
-				// Found the node being referenced, upgrade prefs to
-				// reference it directly for next time.
-				b.prefs.ExitNodeID = peer.StableID
-				b.prefs.ExitNodeIP = netaddr.IP{}
-				prefsChanged = true
-				break peerLoop
-			}
-		}
+	if b.prefs.ExitNodeIP.IsZero() {
+		return false
 	}
 
-	// At this point, we have a node ID if the requested node is in
-	// the netmap. If not, the ID will be empty, and we'll strip out
-	// all default routes.
+	// IP takes precedence over ID, so if both are set, clear ID.
+	if b.prefs.ExitNodeID != "" {
+		b.prefs.ExitNodeID = ""
+		prefsChanged = true
+	}
+
 	for _, peer := range nm.Peers {
-		out := peer.AllowedIPs[:0]
-		for _, allowedIP := range peer.AllowedIPs {
-			if allowedIP.Bits == 0 && peer.StableID != b.prefs.ExitNodeID {
+		for _, addr := range peer.Addresses {
+			if !addr.IsSingleIP() || addr.IP != b.prefs.ExitNodeIP {
 				continue
 			}
-			out = append(out, allowedIP)
+			// Found the node being referenced, upgrade prefs to
+			// reference it directly for next time.
+			b.prefs.ExitNodeID = peer.StableID
+			b.prefs.ExitNodeIP = netaddr.IP{}
+			return true
 		}
-		peer.AllowedIPs = out
 	}
 
-	return prefsChanged
+	return false
 }
 
 // setWgengineStatus is the callback by the wireguard engine whenever it posts a new status.
@@ -608,18 +592,26 @@ func (b *LocalBackend) updateFilter(netMap *netmap.NetworkMap, prefs *ipn.Prefs)
 		haveNetmap   = netMap != nil
 		addrs        []netaddr.IPPrefix
 		packetFilter []filter.Match
-		advRoutes    []netaddr.IPPrefix
+		localNetsB   netaddr.IPSetBuilder
 		shieldsUp    = prefs == nil || prefs.ShieldsUp // Be conservative when not ready
 	)
 	if haveNetmap {
 		addrs = netMap.Addresses
+		for _, p := range addrs {
+			localNetsB.AddPrefix(p)
+		}
 		packetFilter = netMap.PacketFilter
 	}
 	if prefs != nil {
-		advRoutes = prefs.AdvertiseRoutes
+		for _, r := range prefs.AdvertiseRoutes {
+			// TODO: when advertising default routes, trim out local
+			// nets.
+			localNetsB.AddPrefix(r)
+		}
 	}
+	localNets := localNetsB.IPSet()
 
-	changed := deepprint.UpdateHash(&b.filterHash, haveNetmap, addrs, packetFilter, advRoutes, shieldsUp)
+	changed := deepprint.UpdateHash(&b.filterHash, haveNetmap, addrs, packetFilter, localNets.Ranges(), shieldsUp)
 	if !changed {
 		return
 	}
@@ -629,8 +621,6 @@ func (b *LocalBackend) updateFilter(netMap *netmap.NetworkMap, prefs *ipn.Prefs)
 		b.e.SetFilter(filter.NewAllowNone(b.logf))
 		return
 	}
-
-	localNets := unmapIPPrefixes(netMap.Addresses, advRoutes)
 
 	oldFilter := b.e.GetFilter()
 	if shieldsUp {
@@ -1268,7 +1258,7 @@ func (b *LocalBackend) authReconfig() {
 		}
 	}
 
-	cfg, err := nmcfg.WGCfg(nm, b.logf, flags)
+	cfg, err := nmcfg.WGCfg(nm, b.logf, flags, uc.ExitNodeID)
 	if err != nil {
 		b.logf("wgcfg: %v", err)
 		return

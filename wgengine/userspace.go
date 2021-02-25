@@ -26,6 +26,7 @@ import (
 	"go4.org/mem"
 	"inet.af/netaddr"
 	"tailscale.com/control/controlclient"
+	"tailscale.com/health"
 	"tailscale.com/internal/deepprint"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/flowtrack"
@@ -145,46 +146,57 @@ type EngineConfig struct {
 	// which disables such features as DNS configuration and unrestricted ICMP Echo responses.
 	Fake bool
 
-	// FakeImpl, if non-nil, specifies which type of fake implementation to
-	// use. Two values are typical: nil, for a basic ping-only fake
-	// implementation, and netstack.Impl, which brings in gvisor's netstack
-	// to the binary. The desire to keep that out of some binaries is why
-	// this func exists, so wgengine need not depend on gvisor.
-	FakeImpl FakeImplFunc
+	// FakeImplFactory, if non-nil, creates a FakeImpl to use as a fake engine
+	// implementation. Two values are typical: nil, for a basic ping-only fake
+	// implementation, and netstack.Create, which creates a userspace network
+	// stack using gvisor's netstack. The desire to keep netstack out of some
+	// binaries is why the FakeImpl interface exists, so wgengine need not
+	// depend on gvisor.
+	FakeImplFactory FakeImplFactory
 }
 
-// FakeImplFunc is the type used by EngineConfig.FakeImpl. See docs there.
-type FakeImplFunc func(logger.Logf, *tstun.TUN, Engine, *magicsock.Conn) error
+// FakeImpl is a fake or alternate version of Engine that can be started. See
+// EngineConfig.FakeImplFactory for details.
+type FakeImpl interface {
+	Start() error
+}
 
-func NewFakeUserspaceEngine(logf logger.Logf, listenPort uint16, impl FakeImplFunc) (Engine, error) {
+// FakeImplFactory is the type of a function used to create FakeImpls.
+type FakeImplFactory func(logger.Logf, *tstun.TUN, Engine, *magicsock.Conn) (FakeImpl, error)
+
+func NewFakeUserspaceEngine(logf logger.Logf, listenPort uint16, impl FakeImplFactory) (Engine, error) {
 	logf("Starting userspace wireguard engine (with fake TUN device)")
 	conf := EngineConfig{
-		Logf:       logf,
-		TUN:        tstun.NewFakeTUN(),
-		RouterGen:  router.NewFake,
-		ListenPort: listenPort,
-		Fake:       true,
-		FakeImpl:   impl,
+		Logf:            logf,
+		TUN:             tstun.NewFakeTUN(),
+		RouterGen:       router.NewFake,
+		ListenPort:      listenPort,
+		Fake:            true,
+		FakeImplFactory: impl,
 	}
 	return NewUserspaceEngineAdvanced(conf)
 }
 
 // NewUserspaceEngine creates the named tun device and returns a
 // Tailscale Engine running on it.
-func NewUserspaceEngine(logf logger.Logf, tunname string, listenPort uint16) (Engine, error) {
-	if tunname == "" {
+func NewUserspaceEngine(logf logger.Logf, tunName string, listenPort uint16) (Engine, error) {
+	if tunName == "" {
 		return nil, fmt.Errorf("--tun name must not be blank")
 	}
 
-	logf("Starting userspace wireguard engine with tun device %q", tunname)
+	logf("Starting userspace wireguard engine with tun device %q", tunName)
 
-	tun, err := tun.CreateTUN(tunname, minimalMTU)
+	tun, err := tun.CreateTUN(tunName, minimalMTU)
 	if err != nil {
-		diagnoseTUNFailure(logf)
+		diagnoseTUNFailure(tunName, logf)
 		logf("CreateTUN: %v", err)
 		return nil, err
 	}
 	logf("CreateTUN ok.")
+
+	if err := waitInterfaceUp(tun, 90*time.Second, logf); err != nil {
+		return nil, err
+	}
 
 	conf := EngineConfig{
 		Logf:       logf,
@@ -195,10 +207,21 @@ func NewUserspaceEngine(logf logger.Logf, tunname string, listenPort uint16) (En
 
 	e, err := NewUserspaceEngineAdvanced(conf)
 	if err != nil {
-		tun.Close()
 		return nil, err
 	}
 	return e, err
+}
+
+type closeOnErrorPool []func()
+
+func (p *closeOnErrorPool) add(c io.Closer)   { *p = append(*p, func() { c.Close() }) }
+func (p *closeOnErrorPool) addFunc(fn func()) { *p = append(*p, fn) }
+func (p closeOnErrorPool) closeAllIfError(errp *error) {
+	if *errp != nil {
+		for _, closeFn := range p {
+			closeFn()
+		}
+	}
 }
 
 // NewUserspaceEngineAdvanced is like NewUserspaceEngine
@@ -210,8 +233,14 @@ func NewUserspaceEngineAdvanced(conf EngineConfig) (Engine, error) {
 func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 	logf := conf.Logf
 
+	var closePool closeOnErrorPool
+	defer closePool.closeAllIfError(&reterr)
+
+	tunDev := tstun.WrapTUN(logf, conf.TUN)
+	closePool.add(tunDev)
+
 	rconf := tsdns.ResolverConfig{
-		Logf:    conf.Logf,
+		Logf:    logf,
 		Forward: true,
 	}
 	e := &userspaceEngine{
@@ -219,7 +248,7 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 		logf:     logf,
 		reqCh:    make(chan struct{}, 1),
 		waitCh:   make(chan struct{}),
-		tundev:   tstun.WrapTUN(logf, conf.TUN),
+		tundev:   tunDev,
 		resolver: tsdns.NewResolver(rconf),
 		pingers:  make(map[wgkey.Key]*pinger),
 	}
@@ -232,7 +261,6 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 		tshttpproxy.InvalidateCache()
 	})
 	if err != nil {
-		e.tundev.Close()
 		return nil, err
 	}
 	e.linkMon = mon
@@ -254,15 +282,19 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 	}
 	e.magicConn, err = magicsock.NewConn(magicsockOpts)
 	if err != nil {
-		e.tundev.Close()
 		return nil, fmt.Errorf("wgengine: %v", err)
 	}
+	closePool.add(e.magicConn)
 	e.magicConn.SetNetworkUp(e.linkState.AnyInterfaceUp())
 
 	// Respond to all pings only in fake mode.
 	if conf.Fake {
-		if impl := conf.FakeImpl; impl != nil {
-			if err := impl(logf, e.tundev, e, e.magicConn); err != nil {
+		if f := conf.FakeImplFactory; f != nil {
+			impl, err := f(logf, e.tundev, e, e.magicConn)
+			if err != nil {
+				return nil, err
+			}
+			if err := impl.Start(); err != nil {
 				return nil, err
 			}
 		} else {
@@ -337,20 +369,16 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 	// wgdev takes ownership of tundev, will close it when closed.
 	e.logf("Creating wireguard device...")
 	e.wgdev = device.NewDevice(e.tundev, opts)
-	defer func() {
-		if reterr != nil {
-			e.wgdev.Close()
-		}
-	}()
+	closePool.addFunc(e.wgdev.Close)
 
 	// Pass the underlying tun.(*NativeDevice) to the router:
 	// routers do not Read or Write, but do access native interfaces.
 	e.logf("Creating router...")
 	e.router, err = conf.RouterGen(logf, e.wgdev, e.tundev.Unwrap())
 	if err != nil {
-		e.magicConn.Close()
 		return nil, err
 	}
+	closePool.add(e.router)
 
 	go func() {
 		up := false
@@ -376,18 +404,14 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 	e.wgdev.Up()
 	e.logf("Bringing router up...")
 	if err := e.router.Up(); err != nil {
-		e.magicConn.Close()
-		e.wgdev.Close()
 		return nil, err
 	}
-	// TODO(danderson): we should delete this. It's pointless to apply
-	// a no-op settings here.
-	// TODO(bradfitz): counter-point: it tests the router implementation early
-	// to see if any part of it might fail.
+
+	// It's a little pointless to apply no-op settings here (they
+	// should already be empty?), but it at least exercises the
+	// router implementation early on the machine.
 	e.logf("Clearing router settings...")
 	if err := e.router.Set(nil); err != nil {
-		e.magicConn.Close()
-		e.wgdev.Close()
 		return nil, err
 	}
 	e.logf("Starting link monitor...")
@@ -1003,7 +1027,9 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config) 
 			routerCfg.DNS.Nameservers = []netaddr.IP{tsaddr.TailscaleServiceIP()}
 		}
 		e.logf("wgengine: Reconfig: configuring router")
-		if err := e.router.Set(routerCfg); err != nil {
+		err := e.router.Set(routerCfg)
+		health.SetRouterHealth(err)
+		if err != nil {
 			return err
 		}
 	}
@@ -1363,16 +1389,27 @@ func (e *userspaceEngine) Ping(ip netaddr.IP, cb func(*ipnstate.PingResult)) {
 // the system and log some diagnostic info that might help debug why
 // TUN failed. Because TUN's already failed and things the program's
 // about to end, we might as well log a lot.
-func diagnoseTUNFailure(logf logger.Logf) {
+func diagnoseTUNFailure(tunName string, logf logger.Logf) {
 	switch runtime.GOOS {
 	case "linux":
-		diagnoseLinuxTUNFailure(logf)
+		diagnoseLinuxTUNFailure(tunName, logf)
+	case "darwin":
+		diagnoseDarwinTUNFailure(tunName, logf)
 	default:
 		logf("no TUN failure diagnostics for OS %q", runtime.GOOS)
 	}
 }
 
-func diagnoseLinuxTUNFailure(logf logger.Logf) {
+func diagnoseDarwinTUNFailure(tunName string, logf logger.Logf) {
+	if os.Getuid() != 0 {
+		logf("failed to create TUN device as non-root user; use 'sudo tailscaled', or run under launchd with 'sudo tailscaled install-system-daemon'")
+	}
+	if tunName != "utun" {
+		logf("failed to create TUN device %q; try using tun device \"utun\" instead for automatic selection", tunName)
+	}
+}
+
+func diagnoseLinuxTUNFailure(tunName string, logf logger.Logf) {
 	kernel, err := exec.Command("uname", "-r").Output()
 	kernel = bytes.TrimSpace(kernel)
 	if err != nil {

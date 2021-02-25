@@ -43,6 +43,7 @@ import (
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/portmapper"
 	"tailscale.com/net/stun"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -51,6 +52,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
+	"tailscale.com/types/pad32"
 	"tailscale.com/types/wgkey"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/wgcfg"
@@ -142,6 +144,10 @@ type Conn struct {
 	// conditions, including the closest DERP relay and NAT mappings.
 	netChecker *netcheck.Client
 
+	// portMapper is the NAT-PMP/PCP/UPnP prober/client, for requesting
+	// port mappings from NAT devices.
+	portMapper *portmapper.Client
+
 	// sendLogLimit is a rate limiter for errors logged in the (hot)
 	// packet sending codepath. It's so that, if magicsock gets into a
 	// bad state, we don't spam one error per wireguard packet being
@@ -156,6 +162,7 @@ type Conn struct {
 	// derpRecvCh is used by ReceiveIPv4 to read DERP messages.
 	derpRecvCh chan derpReadResult
 
+	_ pad32.Four
 	// derpRecvCountAtomic is how many derpRecvCh sends are pending.
 	// It's incremented by runDerpReader whenever a DERP message
 	// arrives and decremented when they're read.
@@ -348,8 +355,7 @@ func (c *Conn) addDerpPeerRoute(peer key.Public, derpID int, dc *derphttp.Client
 // Mnemonic: 3.3.40 are numbers above the keys D, E, R, P.
 const DerpMagicIP = "127.3.3.40"
 
-var derpMagicIP = net.ParseIP(DerpMagicIP).To4()
-var derpMagicIPAddr = netaddr.IPv4(127, 3, 3, 40)
+var derpMagicIPAddr = netaddr.MustParseIP(DerpMagicIP)
 
 // activeDerp contains fields for an active DERP connection.
 type activeDerp struct {
@@ -358,7 +364,7 @@ type activeDerp struct {
 	writeCh chan<- derpWriteRequest
 	// lastWrite is the time of the last request for its write
 	// channel (currently even if there was no write).
-	// It is always non-nil and initialized to a non-zero Time[
+	// It is always non-nil and initialized to a non-zero Time.
 	lastWrite  *time.Time
 	createTime time.Time
 }
@@ -476,6 +482,7 @@ func NewConn(opts Options) (*Conn, error) {
 	c.noteRecvActivity = opts.NoteRecvActivity
 	c.simulatedNetwork = opts.SimulatedNetwork
 	c.disableLegacy = opts.DisableLegacyNetworking
+	c.portMapper = portmapper.NewClient(logger.WithPrefix(c.logf, "portmapper: "))
 
 	if err := c.initialBind(); err != nil {
 		return nil, err
@@ -487,7 +494,9 @@ func NewConn(opts Options) (*Conn, error) {
 		Logf:                logger.WithPrefix(c.logf, "netcheck: "),
 		GetSTUNConn4:        func() netcheck.STUNConn { return c.pconn4 },
 		SkipExternalNetwork: inTest(),
+		PortMapper:          c.portMapper,
 	}
+
 	if c.pconn6 != nil {
 		c.netChecker.GetSTUNConn6 = func() netcheck.STUNConn { return c.pconn6 }
 	}
@@ -963,6 +972,13 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 	return true
 }
 
+// startDerpHomeConnectLocked starts connecting to our DERP home, if any.
+//
+// c.mu must be held.
+func (c *Conn) startDerpHomeConnectLocked() {
+	c.goDerpConnect(c.myDerp)
+}
+
 // goDerpConnect starts a goroutine to start connecting to the given
 // DERP node.
 //
@@ -996,6 +1012,13 @@ func (c *Conn) determineEndpoints(ctx context.Context) (ipPorts []string, reason
 			already[s] = reason
 			eps = append(eps, s)
 		}
+	}
+
+	if ext, err := c.portMapper.CreateOrGetMapping(ctx); err == nil {
+		c.logf("portmapper: using %v", ext)
+		addAddr(ext.String(), "portmap")
+	} else if !portmapper.IsNoMappingError(err) {
+		c.logf("portmapper: %v", err)
 	}
 
 	if nr.GlobalV4 != "" {
@@ -1067,6 +1090,7 @@ func stringsEqual(x, y []string) bool {
 	return true
 }
 
+// LocalPort returns the current IPv4 listener's port number.
 func (c *Conn) LocalPort() uint16 {
 	laddr := c.pconn4.LocalAddr()
 	return uint16(laddr.Port)
@@ -1441,9 +1465,7 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netaddr.IPPort, d
 			}
 		default:
 			// Ignore.
-			// TODO: handle endpoint notification messages.
 			continue
-
 		}
 
 		if !c.sendDerpReadResult(ctx, res) {
@@ -1532,7 +1554,6 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 
 // findEndpoint maps from a UDP address to a WireGuard endpoint, for
 // ReceiveIPv4/ReceiveIPv6.
-// The provided addr and ipp must match.
 //
 // TODO(bradfitz): add a fast path that returns nil here for normal
 // wireguard-go transport packets; wireguard-go only uses this
@@ -1540,7 +1561,7 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 // Endpoint to find the UDPAddr to return to wireguard anyway, so no
 // benefit unless we can, say, always return the same fake UDPAddr for
 // all packets.
-func (c *Conn) findEndpoint(ipp netaddr.IPPort, addr *net.UDPAddr, packet []byte) conn.Endpoint {
+func (c *Conn) findEndpoint(ipp netaddr.IPPort, packet []byte) conn.Endpoint {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -1552,10 +1573,7 @@ func (c *Conn) findEndpoint(ipp netaddr.IPPort, addr *net.UDPAddr, packet []byte
 		}
 	}
 
-	if addr == nil {
-		addr = ipp.UDPAddr()
-	}
-	return c.findLegacyEndpointLocked(ipp, addr, packet)
+	return c.findLegacyEndpointLocked(ipp, packet)
 }
 
 // aLongTimeAgo is a non-zero time, far in the past, used for
@@ -1579,11 +1597,11 @@ func (c *Conn) ReceiveIPv6(b []byte) (int, conn.Endpoint, error) {
 		return 0, nil, syscall.EAFNOSUPPORT
 	}
 	for {
-		n, pAddr, err := c.pconn6.ReadFrom(b)
+		n, ipp, err := c.pconn6.ReadFromNetaddr(b)
 		if err != nil {
 			return 0, nil, err
 		}
-		if ep, ok := c.receiveIP(b[:n], pAddr.(*net.UDPAddr), &c.ippEndpoint6); ok {
+		if ep, ok := c.receiveIP(b[:n], ipp, &c.ippEndpoint6); ok {
 			return n, ep, nil
 		}
 	}
@@ -1597,13 +1615,13 @@ func (c *Conn) derpPacketArrived() bool {
 // In Tailscale's case, that packet might also arrive via DERP. A DERP packet arrival
 // aborts the pconn4 read deadline to make it fail.
 func (c *Conn) ReceiveIPv4(b []byte) (n int, ep conn.Endpoint, err error) {
-	var pAddr net.Addr
+	var ipp netaddr.IPPort
 	for {
 		// Drain DERP queues before reading new UDP packets.
 		if c.derpPacketArrived() {
 			goto ReadDERP
 		}
-		n, pAddr, err = c.pconn4.ReadFrom(b)
+		n, ipp, err = c.pconn4.ReadFromNetaddr(b)
 		if err != nil {
 			// If the pconn4 read failed, the likely reason is a DERP reader received
 			// a packet and interrupted us.
@@ -1615,7 +1633,7 @@ func (c *Conn) ReceiveIPv4(b []byte) (n int, ep conn.Endpoint, err error) {
 			}
 			return 0, nil, err
 		}
-		if ep, ok := c.receiveIP(b[:n], pAddr.(*net.UDPAddr), &c.ippEndpoint4); ok {
+		if ep, ok := c.receiveIP(b[:n], ipp, &c.ippEndpoint4); ok {
 			return n, ep, nil
 		} else {
 			continue
@@ -1633,11 +1651,7 @@ func (c *Conn) ReceiveIPv4(b []byte) (n int, ep conn.Endpoint, err error) {
 //
 // ok is whether this read should be reported up to wireguard-go (our
 // caller).
-func (c *Conn) receiveIP(b []byte, ua *net.UDPAddr, cache *ippEndpointCache) (ep conn.Endpoint, ok bool) {
-	ipp, ok := netaddr.FromStdAddr(ua.IP, ua.Port, ua.Zone)
-	if !ok {
-		return nil, false
-	}
+func (c *Conn) receiveIP(b []byte, ipp netaddr.IPPort, cache *ippEndpointCache) (ep conn.Endpoint, ok bool) {
 	if stun.Is(b) {
 		c.stunReceiveFunc.Load().(func([]byte, netaddr.IPPort))(b, ipp)
 		return nil, false
@@ -1655,7 +1669,7 @@ func (c *Conn) receiveIP(b []byte, ua *net.UDPAddr, cache *ippEndpointCache) (ep
 	if cache.ipp == ipp && cache.de != nil && cache.gen == cache.de.numStopAndReset() {
 		ep = cache.de
 	} else {
-		ep = c.findEndpoint(ipp, ua, b)
+		ep = c.findEndpoint(ipp, b)
 		if ep == nil {
 			return nil, false
 		}
@@ -1752,7 +1766,7 @@ func (c *Conn) receiveIPv4DERP(b []byte) (n int, ep conn.Endpoint, err error) {
 	} else {
 		key := wgkey.Key(dm.src)
 		c.logf("magicsock: DERP packet from unknown key: %s", key.ShortString())
-		ep = c.findEndpoint(ipp, nil, b[:n])
+		ep = c.findEndpoint(ipp, b[:n])
 		if ep == nil {
 			return 0, nil, errLoopAgain
 		}
@@ -2125,7 +2139,10 @@ func (c *Conn) SetNetworkUp(up bool) {
 	c.logf("magicsock: SetNetworkUp(%v)", up)
 	c.networkUp.Set(up)
 
-	if !up {
+	if up {
+		c.startDerpHomeConnectLocked()
+	} else {
+		c.portMapper.NoteNetworkDown()
 		c.closeAllDerpLocked("network-down")
 	}
 }
@@ -2167,7 +2184,7 @@ func (c *Conn) SetPrivateKey(privateKey wgkey.Private) error {
 	// Key changed. Close existing DERP connections and reconnect to home.
 	if c.myDerp != 0 && !newKey.IsZero() {
 		c.logf("magicsock: private key changed, reconnecting to home derp-%d", c.myDerp)
-		c.goDerpConnect(c.myDerp)
+		c.startDerpHomeConnectLocked()
 	}
 
 	if newKey.IsZero() {
@@ -2257,8 +2274,12 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			continue
 		}
 		numDisco++
-		if ep, ok := c.endpointOfDisco[n.DiscoKey]; ok {
+		if ep, ok := c.endpointOfDisco[n.DiscoKey]; ok && ep.publicKey == n.Key {
 			ep.updateFromNode(n)
+		} else if ok {
+			c.logf("magicsock: disco key %v changed from node key %v to %v", n.DiscoKey, ep.publicKey.ShortString(), n.Key.ShortString())
+			ep.stopAndReset()
+			delete(c.endpointOfDisco, n.DiscoKey)
 		}
 	}
 
@@ -2432,6 +2453,7 @@ func (c *Conn) Close() error {
 		c.derpCleanupTimer.Stop()
 	}
 	c.stopPeriodicReSTUNTimerLocked()
+	c.portMapper.Close()
 
 	for _, ep := range c.endpointOfDisco {
 		ep.stopAndReset()
@@ -2553,6 +2575,7 @@ func (c *Conn) initialBind() error {
 	if err := c.bind1(&c.pconn4, "udp4"); err != nil {
 		return err
 	}
+	c.portMapper.SetLocalPort(c.LocalPort())
 	if err := c.bind1(&c.pconn6, "udp6"); err != nil {
 		c.logf("magicsock: ignoring IPv6 bind failure: %v", err)
 	}
@@ -2627,15 +2650,15 @@ func (c *Conn) Rebind() {
 		return
 	}
 	c.pconn4.Reset(packetConn.(*net.UDPConn))
+	c.portMapper.SetLocalPort(c.LocalPort())
 
 	c.mu.Lock()
 	c.closeAllDerpLocked("rebind")
-	haveKey := !c.privateKey.IsZero()
+	if !c.privateKey.IsZero() {
+		c.startDerpHomeConnectLocked()
+	}
 	c.mu.Unlock()
 
-	if haveKey {
-		c.goDerpConnect(c.myDerp)
-	}
 	c.resetEndpointStates()
 }
 
@@ -2731,6 +2754,8 @@ func (c *RebindingUDPConn) Reset(pconn net.PacketConn) {
 	}
 }
 
+// ReadFromNetaddr reads a packet from c into b.
+// It returns the number of bytes copied and the source address.
 func (c *RebindingUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	for {
 		c.mu.Lock()
@@ -2748,6 +2773,58 @@ func (c *RebindingUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
 			}
 		}
 		return n, addr, err
+	}
+}
+
+// ReadFromNetaddr reads a packet from c into b.
+// It returns the number of bytes copied and the return address.
+// It is identical to c.ReadFrom, except that it returns a netaddr.IPPort instead of a net.Addr.
+// ReadFromNetaddr is designed to work with specific underlying connection types.
+// If c's underlying connection returns a non-*net.UPDAddr return address, ReadFromNetaddr will return an error.
+// ReadFromNetaddr exists because it removes an allocation per read,
+// when c's underlying connection is a net.UDPConn.
+func (c *RebindingUDPConn) ReadFromNetaddr(b []byte) (n int, ipp netaddr.IPPort, err error) {
+	for {
+		c.mu.Lock()
+		pconn := c.pconn
+		c.mu.Unlock()
+
+		// Optimization: Treat *net.UDPConn specially.
+		// ReadFromUDP gets partially inlined, avoiding allocating a *net.UDPAddr,
+		// as long as pAddr itself doesn't escape.
+		// The non-*net.UDPConn case works, but it allocates.
+		var pAddr *net.UDPAddr
+		if udpConn, ok := pconn.(*net.UDPConn); ok {
+			n, pAddr, err = udpConn.ReadFromUDP(b)
+		} else {
+			var addr net.Addr
+			n, addr, err = pconn.ReadFrom(b)
+			if addr != nil {
+				pAddr, ok = addr.(*net.UDPAddr)
+				if !ok {
+					return 0, netaddr.IPPort{}, fmt.Errorf("RebindingUDPConn.ReadFromNetaddr: underlying connection returned address of type %T, want *netaddr.UDPAddr", addr)
+				}
+			}
+		}
+
+		if err != nil {
+			c.mu.Lock()
+			pconn2 := c.pconn
+			c.mu.Unlock()
+
+			if pconn != pconn2 {
+				continue
+			}
+		} else {
+			// Convert pAddr to a netaddr.IPPort.
+			// This prevents pAddr from escaping.
+			var ok bool
+			ipp, ok = netaddr.FromStdAddr(pAddr.IP, pAddr.Port, pAddr.Zone)
+			if !ok {
+				return 0, netaddr.IPPort{}, errors.New("netaddr.FromStdAddr failed")
+			}
+		}
+		return n, ipp, err
 	}
 }
 
@@ -2825,8 +2902,8 @@ func peerShort(k key.Public) string {
 	return k2.ShortString()
 }
 
-func sbPrintAddr(sb *strings.Builder, a net.UDPAddr) {
-	is6 := a.IP.To4() == nil
+func sbPrintAddr(sb *strings.Builder, a netaddr.IPPort) {
+	is6 := a.IP.Is6()
 	if is6 {
 		sb.WriteByte('[')
 	}
@@ -2923,8 +3000,8 @@ func (c *Conn) UpdateStatus(sb *ipnstate.StatusBuilder) {
 	})
 }
 
-func udpAddrDebugString(ua net.UDPAddr) string {
-	if ua.IP.Equal(derpMagicIP) {
+func ippDebugString(ua netaddr.IPPort) string {
+	if ua.IP == derpMagicIPAddr {
 		return fmt.Sprintf("derp-%d", ua.Port)
 	}
 	return ua.String()

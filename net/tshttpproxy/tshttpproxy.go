@@ -71,6 +71,16 @@ func GetAuthHeader(u *url.URL) (string, error) {
 	if fake := os.Getenv("TS_DEBUG_FAKE_PROXY_AUTH"); fake != "" {
 		return fake, nil
 	}
+	if user := u.User.Username(); user != "" {
+		pass, ok := u.User.Password()
+		if !ok {
+			return "", nil
+		}
+
+		req := &http.Request{Header: make(http.Header)}
+		req.SetBasicAuth(user, pass)
+		return req.Header.Get("Authorization"), nil
+	}
 	if sysAuthHeader != nil {
 		return sysAuthHeader(u)
 	}

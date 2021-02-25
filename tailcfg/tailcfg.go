@@ -243,16 +243,8 @@ func (n *Node) DisplayNames(forOwner bool) (name, hostIfDifferent string) {
 // fields: n.ComputedName, n.computedHostIfDifferent, and
 // n.ComputedNameWithHost.
 func (n *Node) InitDisplayNames(networkMagicDNSSuffix string) {
-	dnsName := n.Name
-	if dnsName != "" {
-		dnsName = strings.TrimRight(dnsName, ".")
-		if i := strings.Index(dnsName, "."); i != -1 && dnsname.HasSuffix(dnsName, networkMagicDNSSuffix) {
-			dnsName = dnsName[:i]
-		}
-	}
-
-	name := dnsName
-	hostIfDifferent := n.Hostinfo.Hostname
+	name := dnsname.TrimSuffix(n.Name, networkMagicDNSSuffix)
+	hostIfDifferent := dnsname.SanitizeHostname(n.Hostinfo.Hostname)
 
 	if strings.EqualFold(name, hostIfDifferent) {
 		hostIfDifferent = ""
@@ -406,6 +398,7 @@ type Hostinfo struct {
 	BackendLogID  string             `json:",omitempty"` // logtail ID of backend instance
 	OS            string             // operating system the client runs on (a version.OS value)
 	OSVersion     string             `json:",omitempty"` // operating system version, with optional distro prefix ("Debian 10.4", "Windows 10 Pro 10.0.19041")
+	Package       string             `json:",omitempty"` // Tailscale package to disambiguate ("choco", "appstore", etc; "" for unknown)
 	DeviceModel   string             `json:",omitempty"` // mobile phone model ("Pixel 3a", "iPhone 11 Pro")
 	Hostname      string             // name of the host the client runs on
 	ShieldsUp     bool               `json:",omitempty"` // indicates whether the host is blocking incoming connections
@@ -634,6 +627,8 @@ type MapRequest struct {
 	// Current DebugFlags values are:
 	//     * "warn-ip-forwarding-off": client is trying to be a subnet
 	//       router but their IP forwarding is broken.
+	//     * "warn-router-unhealthy": client's Router implementation is
+	//       having problems.
 	//     * "v6-overlay": IPv6 development flag to have control send
 	//       v6 node addrs
 	//     * "minimize-netmap": have control minimize the netmap, removing
