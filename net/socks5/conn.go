@@ -130,6 +130,6 @@ func (conn *Conn) createReply() error {
 		buf, _ = PacketFromResponse(&Response{reply: GeneralFailure})
 	}
 	conn.client.Write(buf)
-	log.Printf("Wrote out details to %s\n", conn.client.RemoteAddr())
+	log.Printf("Wrote out details to %s", conn.client.RemoteAddr())
 	return err
 }
