@@ -1,3 +1,9 @@
+// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// Package socks5 is an auth-less SOCKS5 server implementation
+// for userspace networking in Tailscale.
 package socks5
 
 import "net"
