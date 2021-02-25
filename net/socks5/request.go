@@ -12,18 +12,18 @@ import (
 
 const maxRequestPacketSize int = 261
 
-// Request reperesents data contained within a SOCKS5
+// request reperesents data contained within a SOCKS5
 // connection request packet.
-type Request struct {
+type request struct {
 	command     Command
 	destination string
 	port        uint16
 	addrType    Addr
 }
 
-// RequestFromPacket converts raw packet bytes into a
+// parseRequestFromPacket converts raw packet bytes into a
 // SOCKS5Request struct.
-func RequestFromPacket(pkt []byte) (*Request, error) {
+func parseRequestFromPacket(pkt []byte) (*request, error) {
 	cmd := pkt[1]
 	addrType := Addr(pkt[3])
 
@@ -45,7 +45,7 @@ func RequestFromPacket(pkt []byte) (*Request, error) {
 			return nil, fmt.Errorf("packet too small to contain FQDN of length %v", dstSize)
 		}
 		destination = string(pkt[5 : 5+dstSize])
-		port = binary.BigEndian.Uint16(pkt[4+dstSize : 4+dstSize+2])
+		port = binary.BigEndian.Uint16(pkt[5+dstSize : 5+dstSize+2])
 	} else if addrType == IPv6 {
 		if len(pkt) < minPacketSize+16 {
 			return nil, fmt.Errorf("packet too small to contain IPv6 address")
@@ -56,7 +56,7 @@ func RequestFromPacket(pkt []byte) (*Request, error) {
 		return nil, fmt.Errorf("unsupported address type")
 	}
 
-	return &Request{
+	return &request{
 		command:     Command(cmd),
 		destination: destination,
 		port:        port,

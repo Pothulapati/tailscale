@@ -40,10 +40,10 @@ type Response struct {
 	bindPort uint16
 }
 
-// PacketFromResponse converts a SOCKS5Response struct into
+// createPacketFromResponse converts a SOCKS5Response struct into
 // a packet. If res.reply == Success, it may throw an error on
 // receiving an invalid bind address. Otherwise, it will not throw.
-func PacketFromResponse(res *Response) ([]byte, error) {
+func createPacketFromResponse(res *Response) ([]byte, error) {
 	pkt := make([]byte, 0, maxResponsePacketSize)
 	pkt = append(pkt, SOCKS5Version)
 	pkt = append(pkt, byte(res.reply))

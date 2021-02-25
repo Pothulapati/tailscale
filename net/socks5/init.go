@@ -8,34 +8,25 @@ import "fmt"
 
 const maxInitRequestSize = 257
 
-// MethodsFromInitPacket parses a request initiation packet
+// HandleInitPacket parses a request initiation packet
 // and returns a slice that contains the acceptable auth methods
 // for the client.
-func MethodsFromInitPacket(pkt []byte) ([]AuthMethod, error) {
+func HandleInitPacket(pkt []byte) error {
 	sz := len(pkt)
 	if sz < 3 {
-		return nil, fmt.Errorf("invalid read packet")
+		return fmt.Errorf("invalid read packet")
 	}
 	if pkt[0] != SOCKS5Version {
-		return nil, fmt.Errorf("incompatible SOCKS version")
+		return fmt.Errorf("incompatible SOCKS version")
 	}
 	count := int(pkt[1])
 	if sz < count+2 {
-		return nil, fmt.Errorf("incorrect nmethods specified: %v vs %v", count, sz-2)
+		return fmt.Errorf("incorrect nmethods specified: %v vs %v", count, sz-2)
 	}
-
-	methods := make([]AuthMethod, count)
-	for i := range methods {
-		methods[i] = AuthMethod(pkt[i+2])
+	for _, m := range pkt[2:] {
+		if m == noAuthRequired {
+			return nil
+		}
 	}
-	return methods, nil
-}
-
-// InitResponse creates a packet that tells the client which
-// auth method has been selected.
-func InitResponse(method AuthMethod) []byte {
-	res := make([]byte, 2)
-	res[0] = SOCKS5Version
-	res[1] = byte(method)
-	return res
+	return fmt.Errorf("no acceptable auth methods")
 }
